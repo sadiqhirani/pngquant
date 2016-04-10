@@ -1,15 +1,19 @@
 # libimagequant—Image Quantization Library
 
 Small, portable C library for high-quality conversion of RGBA images to 8-bit indexed-color (palette) images.
-It's powering [pngquant2](http://pngquant.org).
+It's powering [pngquant2](https://pngquant.org).
 
 ## License
 
-Libimagequant is is available under [GPL v3 or later](https://raw.github.com/pornel/pngquant/master/lib/COPYRIGHT) with additional copyright notices for older parts of the code.
+Libimagequant is dual-licensed:
+
+* For Free/Libre Open Source Software it's available under [GPL v3 or later](https://raw.github.com/pornel/pngquant/master/lib/COPYRIGHT) with additional copyright notices for older parts of the code.
+
+* For use in commercial/closed-source/AppStore software please ask kornel@pngquant.org for a license.
 
 ## Download
 
-The [library](http://pngquant.org/lib) is currently a part of the [pngquant2 project](https://github.com/pornel/pngquant/tree/master/lib).
+The [library](https://pngquant.org/lib) is currently a part of the [pngquant2 project](https://github.com/pornel/pngquant/tree/master/lib).
 
 Files needed for the library are only in the `lib/` directory inside the repository (and you can ignore the rest).
 
@@ -148,7 +152,7 @@ The bitmap must not be modified or freed until this object is freed with `liq_im
 
 `width` and `height` are dimensions in pixels. An image 10x10 pixel large will need 400-byte bitmap.
 
-`gamma` can be `0` for images with the typical 1/2.2 [gamma](http://en.wikipedia.org/wiki/Gamma_correction).
+`gamma` can be `0` for images with the typical 1/2.2 [gamma](https://en.wikipedia.org/wiki/Gamma_correction).
 Otherwise `gamma` must be > 0 and < 1, e.g. `0.45455` (1/2.2) or `0.55555` (1/1.8). Generated palette will use the same gamma unless `liq_set_output_gamma()` is used. If `liq_set_output_gamma` is not used, then it only affects whether brighter or darker areas of the image will get more palette colors allocated.
 
 Returns `NULL` on failure, e.g. if `bitmap` is `NULL` or `width`/`height` is <= 0.
@@ -428,15 +432,36 @@ Analoguous to `liq_get_remapping_error()`, but returns quantization error as qua
 
     void log_flush_callback_function(const liq_attr*, void *user_info) {}
 
-Sets up callback function to be called when the library reports work progress or errors. The callback must not call any library functions.
+Sets up callback function to be called when the library reports status or errors. The callback must not call any library functions.
 
-`user_info` value will be passed to the callback.
+`user_info` value will be passed through to the callback. It can be `NULL`.
 
 `NULL` callback clears the current callback.
 
-In the log callback the `message` is a zero-terminated string containing informative message to output. It is valid only until the callback returns.
+In the log callback the `message` is a zero-terminated string containing informative message to output. It is valid only until the callback returns, so you must copy it.
 
 `liq_set_log_flush_callback()` sets up callback function that will be called after the last log callback, which can be used to flush buffers and free resources used by the log callback.
+
+----
+
+    void liq_set_progress_callback(liq_attr*, liq_progress_callback_function*, void *user_info);
+    void liq_result_set_progress_callback(liq_result*, liq_progress_callback_function*, void *user_info);
+
+<p>
+
+    int progress_callback_function(const liq_attr*, float progress_percent, void *user_info) {}
+
+Sets up callback function to be called while the library is processing images. The callback may abort processing by returning `0`.
+
+Setting callback to `NULL` clears the current callback. `liq_set_progress_callback` is for quantization progress, and `liq_result_set_progress_callback` is for remapping progress (currently only dithered remapping reports progress).
+
+`user_info` value will be passed through to the callback. It can be `NULL`.
+
+The callback must not call any library functions.
+
+`progress_percent` is a value between 0 and 100 that estimates how much of the current task has been done.
+
+The callback should return `1` to continue the operation, and `0` to abort current operation.
 
 ----
 
