@@ -37,7 +37,7 @@
 #include <string.h>
 #include <limits.h>
 
-#include "png.h"
+#include "png.h"  /* if this include fails, you need to install libpng (e.g. libpng-devel package) and run ./configure */
 #include "rwpng.h"
 #if USE_LCMS
 #include "lcms2.h"
@@ -61,8 +61,6 @@ typedef png_const_charp png_const_bytep;
 #endif
 
 static void rwpng_error_handler(png_structp png_ptr, png_const_charp msg);
-static void rwpng_warning_stderr_handler(png_structp png_ptr, png_const_charp msg);
-static void rwpng_warning_silent_handler(png_structp png_ptr, png_const_charp msg);
 int rwpng_read_image24_cocoa(FILE *infile, png24_image *mainprog_ptr);
 
 
@@ -75,7 +73,7 @@ void rwpng_version_info(FILE *fp)
 #elif USE_LCMS
     fprintf(fp, "   Color profiles are supported via Little CMS. Using libpng %s.\n", pngver);
 #else
-    fprintf(fp, "   Compiled without support for color profiles. Using libpng %s.\n", pngver);
+    fprintf(fp, "   Compiled with no support for color profiles. Using libpng %s.\n", pngver);
 #endif
 
 #if PNG_LIBPNG_VER < 10600
@@ -97,6 +95,7 @@ struct rwpng_read_data {
     png_size_t bytes_read;
 };
 
+#if !USE_COCOA
 static void user_read_data(png_structp png_ptr, png_bytep data, png_size_t length)
 {
     struct rwpng_read_data *read_data = (struct rwpng_read_data *)png_get_io_ptr(png_ptr);
@@ -107,6 +106,7 @@ static void user_read_data(png_structp png_ptr, png_bytep data, png_size_t lengt
     }
     read_data->bytes_read += read;
 }
+#endif
 
 struct rwpng_write_state {
     FILE *outfile;
@@ -150,12 +150,17 @@ static png_bytepp rwpng_create_row_pointers(png_infop info_ptr, png_structp png_
     return row_pointers;
 }
 
+#if !USE_COCOA
 static int read_chunk_callback(png_structp png_ptr, png_unknown_chunkp in_chunk)
 {
     if (0 == memcmp("iCCP", in_chunk->name, 5) ||
         0 == memcmp("cHRM", in_chunk->name, 5) ||
         0 == memcmp("gAMA", in_chunk->name, 5)) {
         return 0; // not handled
+    }
+
+    if (in_chunk->location == 0 ) {
+        return 1; // ignore chunks with invalid location
     }
 
     struct rwpng_chunk **head = (struct rwpng_chunk **)png_get_user_chunk_ptr(png_ptr);
@@ -174,6 +179,7 @@ static int read_chunk_callback(png_structp png_ptr, png_unknown_chunkp in_chunk)
 
     return 1; // marks as "handled", libpng won't store it
 }
+#endif
 
 /*
    retval:
@@ -185,7 +191,15 @@ static int read_chunk_callback(png_structp png_ptr, png_unknown_chunkp in_chunk)
     26 = wrong PNG color type (no alpha channel)
  */
 
-static pngquant_error rwpng_read_image24_libpng(FILE *infile, png24_image *mainprog_ptr, int verbose)
+#if !USE_COCOA
+static void rwpng_warning_stderr_handler(png_structp png_ptr, png_const_charp msg) {
+    fprintf(stderr, "  libpng warning: %s\n", msg);
+}
+
+static void rwpng_warning_silent_handler(png_structp png_ptr, png_const_charp msg) {
+}
+
+static pngquant_error rwpng_read_image24_libpng(FILE *infile, png24_image *mainprog_ptr, int strip, int verbose)
 {
     png_structp  png_ptr = NULL;
     png_infop    info_ptr = NULL;
@@ -212,11 +226,19 @@ static pngquant_error rwpng_read_image24_libpng(FILE *infile, png24_image *mainp
         return LIBPNG_FATAL_ERROR;   /* fatal libpng error (via longjmp()) */
     }
 
-#if PNG_LIBPNG_VER >= 10500 && defined(PNG_UNKNOWN_CHUNKS_SUPPORTED)
-    /* copy standard chunks too */
-    png_set_keep_unknown_chunks(png_ptr, PNG_HANDLE_CHUNK_IF_SAFE, (png_const_bytep)"pHYs\0iTXt\0tEXt\0zTXt", 4);
+#if defined(PNG_SKIP_sRGB_CHECK_PROFILE) && defined(PNG_SET_OPTION_SUPPORTED)
+    png_set_option(png_ptr, PNG_SKIP_sRGB_CHECK_PROFILE, PNG_OPTION_ON);
 #endif
-    png_set_read_user_chunk_fn(png_ptr, &mainprog_ptr->chunks, read_chunk_callback);
+
+#if PNG_LIBPNG_VER >= 10500 && defined(PNG_UNKNOWN_CHUNKS_SUPPORTED)
+    if (!strip) {
+        /* copy standard chunks too */
+        png_set_keep_unknown_chunks(png_ptr, PNG_HANDLE_CHUNK_IF_SAFE, (png_const_bytep)"pHYs\0iTXt\0tEXt\0zTXt", 4);
+    }
+#endif
+    if (!strip) {
+        png_set_read_user_chunk_fn(png_ptr, &mainprog_ptr->chunks, read_chunk_callback);
+    }
 
     struct rwpng_read_data read_data = {infile, 0};
     png_set_read_fn(png_ptr, &read_data, user_read_data);
@@ -229,12 +251,6 @@ static pngquant_error rwpng_read_image24_libpng(FILE *infile, png24_image *mainp
 
     png_get_IHDR(png_ptr, info_ptr, &mainprog_ptr->width, &mainprog_ptr->height,
                  &bit_depth, &color_type, NULL, NULL, NULL);
-
-    // For overflow safety reject images that won't fit in 32-bit
-    if (mainprog_ptr->width > INT_MAX/mainprog_ptr->height) {
-        png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
-        return PNG_OUT_OF_MEMORY_ERROR;  /* not quite true, but whatever */
-    }
 
     /* expand palette images to RGB, low-bit-depth grayscale images to 8 bits,
      * transparency chunks to full alpha channel; strip 16-bit-per-sample
@@ -289,6 +305,12 @@ static pngquant_error rwpng_read_image24_libpng(FILE *infile, png24_image *mainp
     png_read_update_info(png_ptr, info_ptr);
 
     rowbytes = png_get_rowbytes(png_ptr, info_ptr);
+
+    // For overflow safety reject images that won't fit in 32-bit
+    if (rowbytes > INT_MAX/mainprog_ptr->height) {
+        png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+        return PNG_OUT_OF_MEMORY_ERROR;
+    }
 
     if ((mainprog_ptr->rgba_data = malloc(rowbytes * mainprog_ptr->height)) == NULL) {
         fprintf(stderr, "pngquant readpng:  unable to allocate image data\n");
@@ -402,6 +424,7 @@ static pngquant_error rwpng_read_image24_libpng(FILE *infile, png24_image *mainp
 
     return SUCCESS;
 }
+#endif
 
 static void rwpng_free_chunks(struct rwpng_chunk *chunk) {
     if (!chunk) return;
@@ -434,12 +457,12 @@ void rwpng_free_image8(png8_image *image)
     image->chunks = NULL;
 }
 
-pngquant_error rwpng_read_image24(FILE *infile, png24_image *input_image_p, int verbose)
+pngquant_error rwpng_read_image24(FILE *infile, png24_image *input_image_p, int strip, int verbose)
 {
 #if USE_COCOA
     return rwpng_read_image24_cocoa(infile, input_image_p);
 #else
-    return rwpng_read_image24_libpng(infile, input_image_p, verbose);
+    return rwpng_read_image24_libpng(infile, input_image_p, strip, verbose);
 #endif
 }
 
@@ -500,10 +523,12 @@ static void rwpng_set_gamma(png_infop info_ptr, png_structp png_ptr, double gamm
     }
 }
 
-pngquant_error rwpng_write_image8(FILE *outfile, const png8_image *mainprog_ptr)
+pngquant_error rwpng_write_image8(FILE *outfile, png8_image *mainprog_ptr)
 {
     png_structp png_ptr;
     png_infop info_ptr;
+
+    if (mainprog_ptr->num_palette > 256) return INVALID_ARGUMENT;
 
     pngquant_error retval = rwpng_write_image_init((rwpng_png_image*)mainprog_ptr, &png_ptr, &info_ptr, mainprog_ptr->fast_compression);
     if (retval) return retval;
@@ -535,6 +560,7 @@ pngquant_error rwpng_write_image8(FILE *outfile, const png8_image *mainprog_ptr)
         sample_depth = 8;
 
     struct rwpng_chunk *chunk = mainprog_ptr->chunks;
+    mainprog_ptr->metadata_size = 0;
     int chunk_num=0;
     while(chunk) {
         png_unknown_chunk pngchunk = {
@@ -549,6 +575,7 @@ pngquant_error rwpng_write_image8(FILE *outfile, const png8_image *mainprog_ptr)
         png_set_unknown_chunk_location(png_ptr, info_ptr, chunk_num, pngchunk.location ? pngchunk.location : PNG_HAVE_IHDR);
         #endif
 
+        mainprog_ptr->metadata_size += chunk->size + 12;
         chunk = chunk->next;
         chunk_num++;
     }
@@ -558,10 +585,25 @@ pngquant_error rwpng_write_image8(FILE *outfile, const png8_image *mainprog_ptr)
       0, PNG_COMPRESSION_TYPE_DEFAULT,
       PNG_FILTER_TYPE_BASE);
 
-    png_set_PLTE(png_ptr, info_ptr, &mainprog_ptr->palette[0], mainprog_ptr->num_palette);
+    png_color palette[256];
+    png_byte trans[256];
+    unsigned int num_trans = 0;
+    for(unsigned int i = 0; i < mainprog_ptr->num_palette; i++) {
+        palette[i] = (png_color){
+            .red   = mainprog_ptr->palette[i].r,
+            .green = mainprog_ptr->palette[i].g,
+            .blue  = mainprog_ptr->palette[i].b,
+        };
+        trans[i] = mainprog_ptr->palette[i].a;
+        if (mainprog_ptr->palette[i].a < 255) {
+            num_trans = i+1;
+        }
+    }
 
-    if (mainprog_ptr->num_trans > 0) {
-        png_set_tRNS(png_ptr, info_ptr, mainprog_ptr->trans, mainprog_ptr->num_trans, NULL);
+    png_set_PLTE(png_ptr, info_ptr, palette, mainprog_ptr->num_palette);
+
+    if (num_trans > 0) {
+        png_set_tRNS(png_ptr, info_ptr, trans, num_trans, NULL);
     }
 
     rwpng_write_end(&info_ptr, &png_ptr, mainprog_ptr->row_pointers);
@@ -598,14 +640,6 @@ pngquant_error rwpng_write_image24(FILE *outfile, const png24_image *mainprog_pt
     free(row_pointers);
 
     return SUCCESS;
-}
-
-
-static void rwpng_warning_stderr_handler(png_structp png_ptr, png_const_charp msg) {
-    fprintf(stderr, "  %s\n", msg);
-}
-
-static void rwpng_warning_silent_handler(png_structp png_ptr, png_const_charp msg) {
 }
 
 static void rwpng_error_handler(png_structp png_ptr, png_const_charp msg)

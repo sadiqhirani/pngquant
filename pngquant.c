@@ -39,7 +39,7 @@
 **
 */
 
-#define PNGQUANT_VERSION LIQ_VERSION_STRING " (April 2016)"
+#define PNGQUANT_VERSION LIQ_VERSION_STRING " (March 2017)"
 
 #define PNGQUANT_USAGE "\
 usage:  pngquant [options] [ncolors] -- pngfile [pngfile ...]\n\
@@ -53,12 +53,15 @@ options:\n\
   --speed N         speed/quality trade-off. 1=slow, 3=default, 11=fast & rough\n\
   --nofs            disable Floyd-Steinberg dithering\n\
   --posterize N     output lower-precision color (e.g. for ARGB4444 output)\n\
+  --strip           remove optional metadata (default on Mac)\n\
   --verbose         print status messages (synonym: -v)\n\
 \n\
 Quantizes one or more 32-bit RGBA PNGs to 8-bit (or smaller) RGBA-palette.\n\
 The output filename is the same as the input name except that\n\
 it ends in \"-fs8.png\", \"-or8.png\" or your custom extension (unless the\n\
 input is stdin, in which case the quantized image will go to stdout).\n\
+If you pass the special output path \"-\" and a single input file, that file\n\
+will be processed and the quantized image will go to stdout.\n\
 The default behavior if the output file exists is to skip the conversion;\n\
 use --force to overwrite. See man page for full list of options.\n"
 
@@ -70,6 +73,7 @@ use --force to overwrite. See man page for full list of options.\n"
 #include <stdbool.h>
 #include <getopt.h>
 #include <unistd.h>
+#include <math.h>
 
 extern char *optarg;
 extern int optind, opterr;
@@ -97,12 +101,13 @@ struct pngquant_options {
     float floyd;
     bool using_stdin, using_stdout, force, fast_compression, ie_mode,
         min_quality_limit, skip_if_larger,
+        strip,
         verbose;
 };
 
 static pngquant_error prepare_output_image(liq_result *result, liq_image *input_image, rwpng_color_transform tag, png8_image *output_image);
 static void set_palette(liq_result *result, png8_image *output_image);
-static pngquant_error read_image(liq_attr *options, const char *filename, int using_stdin, png24_image *input_image_p, liq_image **liq_image_p, bool keep_input_pixels, bool verbose);
+static pngquant_error read_image(liq_attr *options, const char *filename, int using_stdin, png24_image *input_image_p, liq_image **liq_image_p, bool keep_input_pixels, bool strip, bool verbose);
 static pngquant_error write_image(png8_image *output_image, png24_image *output_image24, const char *outname, struct pngquant_options *options);
 static char *add_filename_extension(const char *filename, const char *newext);
 static bool file_exists(const char *outname);
@@ -162,7 +167,7 @@ static void log_callback_buferred(const liq_attr *attr, const char *msg, void* c
 
 static void print_full_version(FILE *fd)
 {
-    fprintf(fd, "pngquant, %s, by Greg Roelofs, Kornel Lesinski.\n"
+    fprintf(fd, "pngquant, %s, by Kornel Lesinski, Greg Roelofs.\n"
         #ifndef NDEBUG
                     "   WARNING: this is a DEBUG (slow) version.\n" /* NDEBUG disables assert() */
         #endif
@@ -254,7 +259,7 @@ static void fix_obsolete_options(const unsigned int argc, char *argv[])
 }
 
 enum {arg_floyd=1, arg_ordered, arg_ext, arg_no_force, arg_iebug,
-    arg_transbug, arg_map, arg_posterize, arg_skip_larger};
+    arg_transbug, arg_map, arg_posterize, arg_skip_larger, arg_strip};
 
 static const struct option long_options[] = {
     {"verbose", no_argument, NULL, 'v'},
@@ -272,6 +277,7 @@ static const struct option long_options[] = {
     {"speed", required_argument, NULL, 's'},
     {"quality", required_argument, NULL, 'Q'},
     {"posterize", required_argument, NULL, arg_posterize},
+    {"strip", no_argument, NULL, arg_strip},
     {"map", required_argument, NULL, arg_map},
     {"version", no_argument, NULL, 'V'},
     {"help", no_argument, NULL, 'h'},
@@ -285,6 +291,7 @@ int main(int argc, char *argv[])
 {
     struct pngquant_options options = {
         .floyd = 1.f, // floyd-steinberg dithering
+        .strip = false,
     };
     options.liq = liq_attr_create();
 
@@ -327,6 +334,10 @@ int main(int argc, char *argv[])
                 if (output_file_path) {
                     fputs("--output option can be used only once\n", stderr);
                     return INVALID_ARGUMENT;
+                }
+                if (strcmp(optarg, "-") == 0) {
+                    options.using_stdout = true;
+                    break;
                 }
                 output_file_path = optarg; break;
 
@@ -375,13 +386,27 @@ int main(int argc, char *argv[])
                 }
                 break;
 
+            case arg_strip:
+                options.strip = true;
+                break;
+
             case arg_map:
                 {
                     png24_image tmp = {};
-                    if (SUCCESS != read_image(options.liq, optarg, false, &tmp, &options.fixed_palette_image, false, false)) {
+                    if (SUCCESS != read_image(options.liq, optarg, false, &tmp, &options.fixed_palette_image, true, true, false)) {
                         fprintf(stderr, "  error: unable to load %s", optarg);
                         return INVALID_ARGUMENT;
                     }
+                    liq_result *tmp_quantize = liq_quantize_image(options.liq, options.fixed_palette_image);
+                    const liq_palette *pal = liq_get_palette(tmp_quantize);
+                    if (!pal) {
+                        fprintf(stderr, "  error: unable to read colors from %s", optarg);
+                        return INVALID_ARGUMENT;
+                    }
+                    for(unsigned int i=0; i < pal->count; i++) {
+                        liq_image_add_fixed_color(options.fixed_palette_image, pal->entries[i]);
+                    }
+                    liq_result_destroy(tmp_quantize);
                 }
                 break;
 
@@ -453,6 +478,10 @@ int main(int argc, char *argv[])
         fputs("Only one input file is allowed when --output is used\n", stderr);
         return INVALID_ARGUMENT;
     }
+    if (options.using_stdout && !options.using_stdin && num_files != 1) {
+        fputs("Only one input file is allowed when using the special output path \"-\" to write to stdout\n", stderr);
+        return INVALID_ARGUMENT;
+    }
 
 #ifdef _OPENMP
     // if there's a lot of files, coarse parallelism can be used
@@ -477,8 +506,8 @@ int main(int argc, char *argv[])
         if (opts.log_callback && omp_get_num_threads() > 1 && num_files > 1) {
             liq_set_log_callback(opts.liq, log_callback_buferred, &buf);
             liq_set_log_flush_callback(opts.liq, log_callback_buferred_flush, &buf);
-            options.log_callback = log_callback_buferred;
-            options.log_callback_user_info = &buf;
+            opts.log_callback = log_callback_buferred;
+            opts.log_callback_user_info = &buf;
         }
         #endif
 
@@ -487,11 +516,11 @@ int main(int argc, char *argv[])
 
         const char *outname = output_file_path;
         char *outname_free = NULL;
-        if (!options.using_stdout) {
+        if (!opts.using_stdout) {
             if (!outname) {
                 outname = outname_free = add_filename_extension(filename, newext);
             }
-            if (!options.force && file_exists(outname)) {
+            if (!opts.force && file_exists(outname)) {
                 fprintf(stderr, "  error: '%s' exists; not overwriting\n", outname);
                 retval = NOT_OVERWRITING_ERROR;
             }
@@ -528,11 +557,11 @@ int main(int argc, char *argv[])
                        skipped_count, (skipped_count == 1)? "" : "s", file_count, (file_count == 1)? "" : "s");
     }
     if (!skipped_count && !error_count) {
-        verbose_printf(&options, "No errors detected while quantizing %d image%s.",
+        verbose_printf(&options, "Quantized %d image%s.",
                        file_count, (file_count == 1)? "" : "s");
     }
 
-    liq_image_destroy(options.fixed_palette_image);
+    if (options.fixed_palette_image) liq_image_destroy(options.fixed_palette_image);
     liq_attr_destroy(options.liq);
 
     return latest_error;
@@ -548,7 +577,7 @@ pngquant_error pngquant_file(const char *filename, const char *outname, struct p
     png24_image input_image_rwpng = {};
     bool keep_input_pixels = options->skip_if_larger || (options->using_stdout && options->min_quality_limit); // original may need to be output to stdout
     if (SUCCESS == retval) {
-        retval = read_image(options->liq, filename, options->using_stdin, &input_image_rwpng, &input_image, keep_input_pixels, options->verbose);
+        retval = read_image(options->liq, filename, options->using_stdin, &input_image_rwpng, &input_image, keep_input_pixels, options->strip, options->verbose);
     }
 
     int quality_percent = 90; // quality on 0-100 scale, updated upon successful remap
@@ -572,9 +601,10 @@ pngquant_error pngquant_file(const char *filename, const char *outname, struct p
         }
 
         // when using image as source of a fixed palette the palette is extracted using regular quantization
-        liq_result *remap = liq_quantize_image(options->liq, options->fixed_palette_image ? options->fixed_palette_image : input_image);
+        liq_result *remap;
+        liq_error remap_error = liq_image_quantize(options->fixed_palette_image ? options->fixed_palette_image : input_image, options->liq, &remap);
 
-        if (remap) {
+        if (LIQ_OK == remap_error) {
 
             // fixed gamma ~2.2 for the web. PNG can't store exact 1/2.2
             // NB: can't change gamma here, because output_color is allowed to be an sRGB tag
@@ -596,8 +626,10 @@ pngquant_error pngquant_file(const char *filename, const char *outname, struct p
                 }
             }
             liq_result_destroy(remap);
-        } else {
+        } else if (LIQ_QUALITY_TOO_LOW == remap_error) {
             retval = TOO_LOW_QUALITY;
+        } else {
+            retval = INVALID_ARGUMENT; // dunno
         }
     }
 
@@ -605,9 +637,11 @@ pngquant_error pngquant_file(const char *filename, const char *outname, struct p
 
         if (options->skip_if_larger) {
             // this is very rough approximation, but generally avoid losing more quality than is gained in file size.
-            // Quality is squared, because even greater savings are needed to justify big quality loss.
-            double quality = quality_percent/100.0;
-            output_image.maximum_file_size = (input_image_rwpng.file_size-1) * quality*quality;
+            // Quality is raised to 1.5, because even greater savings are needed to justify big quality loss.
+            // but >50% savings are considered always worthwile in order to allow low quality conversions to work at all
+            const double quality = quality_percent/100.0;
+            const double expected_reduced_size = pow(quality, 1.5);
+            output_image.maximum_file_size = (input_image_rwpng.file_size-1) * (expected_reduced_size < 0.5 ? 0.5 : expected_reduced_size);
         }
 
         output_image.fast_compression = options->fast_compression;
@@ -616,6 +650,9 @@ pngquant_error pngquant_file(const char *filename, const char *outname, struct p
 
         if (TOO_LARGE_FILE == retval) {
             verbose_printf(options, "  file exceeded expected size of %luKB", (unsigned long)output_image.maximum_file_size/1024UL);
+        }
+        if (SUCCESS == retval && output_image.metadata_size > 0) {
+            verbose_printf(options, "  copied %dKB of additional PNG metadata", (int)(output_image.metadata_size+999)/1000);
         }
     }
 
@@ -639,16 +676,10 @@ static void set_palette(liq_result *result, png8_image *output_image)
 {
     const liq_palette *palette = liq_get_palette(result);
 
-    // tRNS, etc.
     output_image->num_palette = palette->count;
-    output_image->num_trans = 0;
     for(unsigned int i=0; i < palette->count; i++) {
-        liq_color px = palette->entries[i];
-        if (px.a < 255) {
-            output_image->num_trans = i+1;
-        }
-        output_image->palette[i] = (png_color){.red=px.r, .green=px.g, .blue=px.b};
-        output_image->trans[i] = px.a;
+        const liq_color px = palette->entries[i];
+        output_image->palette[i] = (rwpng_rgba){.r=px.r, .g=px.g, .b=px.b, .a=px.a};
     }
 }
 
@@ -781,13 +812,13 @@ static pngquant_error write_image(png8_image *output_image, png24_image *output_
     free(tempname);
 
     if (retval && retval != TOO_LARGE_FILE) {
-        fprintf(stderr, "  error: failed writing image to %s\n", outname);
+        fprintf(stderr, "  error: failed writing image to %s (%d)\n", options->using_stdout ? "stdout" : outname, retval);
     }
 
     return retval;
 }
 
-static pngquant_error read_image(liq_attr *options, const char *filename, int using_stdin, png24_image *input_image_p, liq_image **liq_image_p, bool keep_input_pixels, bool verbose)
+static pngquant_error read_image(liq_attr *options, const char *filename, int using_stdin, png24_image *input_image_p, liq_image **liq_image_p, bool keep_input_pixels, bool strip, bool verbose)
 {
     FILE *infile;
 
@@ -802,7 +833,7 @@ static pngquant_error read_image(liq_attr *options, const char *filename, int us
     pngquant_error retval;
     #pragma omp critical (libpng)
     {
-        retval = rwpng_read_image24(infile, input_image_p, verbose);
+        retval = rwpng_read_image24(infile, input_image_p, strip, verbose);
     }
 
     if (!using_stdin) {
@@ -856,12 +887,6 @@ static pngquant_error prepare_output_image(liq_result *result, liq_image *input_
     const liq_palette *palette = liq_get_palette(result);
     // tRNS, etc.
     output_image->num_palette = palette->count;
-    output_image->num_trans = 0;
-    for(unsigned int i=0; i < palette->count; i++) {
-        if (palette->entries[i].a < 255) {
-            output_image->num_trans = i+1;
-        }
-    }
 
     return SUCCESS;
 }

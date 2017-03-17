@@ -18,22 +18,18 @@ DISTFILES = *.[chm] pngquant.1 Makefile configure README.md INSTALL CHANGELOG CO
 TARNAME = pngquant-$(VERSION)
 TARFILE = $(TARNAME)-src.tar.gz
 
-LIBDISTFILES = lib/*.[ch] lib/COPYRIGHT lib/MANUAL.md lib/configure lib/Makefile
-
-DLL=libimagequant.dll
-DLLIMP=libimagequant_dll.a
-DLLDEF=libimagequant_dll.def
+LIBDISTFILES = lib/*.[ch] lib/COPYRIGHT lib/README.md lib/configure lib/Makefile
 
 TESTBIN = test/test
 
 all: $(BIN)
 
-staticlib:
+staticlib: $(STATICLIB)
+
+$(STATICLIB): config.mk $(LIBDISTFILES)
 	$(MAKE) -C lib static
 
-$(STATICLIB): config.mk staticlib
-
-sharedlib:
+sharedlib: lib/libimagequant.h
 	$(MAKE) -C lib shared
 
 $(SHAREDLIB): config.mk sharedlib
@@ -41,7 +37,7 @@ $(SHAREDLIB): config.mk sharedlib
 $(OBJS): $(wildcard *.h) config.mk
 
 rwpng_cocoa.o: rwpng_cocoa.m
-	$(CC) -Wno-enum-conversion -c $(CFLAGS) -o $@ $< &> /dev/null || clang -Wno-enum-conversion -c -O3 $(CFLAGS) -o $@ $<
+	$(CC) -Wno-enum-conversion -c $(CFLAGS) -o $@ $< &> /dev/null || clang -Wno-enum-conversion -c -O3 -o $@ $<
 
 $(BIN): $(OBJS) $(STATICLIB)
 	$(CC) $^ $(CFLAGS) $(LDFLAGS) -o $@
@@ -90,10 +86,13 @@ distclean: clean
 	$(MAKE) -C lib distclean
 	rm -f config.mk pngquant-*-src.tar.gz
 
-config.mk:
+config.mk: lib/libimagequant.h
 ifeq ($(filter %clean %distclean, $(MAKECMDGOALS)), )
 	./configure
 endif
+
+lib/libimagequant.h:
+	git submodule init && git submodule update || true
 
 .PHONY: all clean dist distclean dll install uninstall test staticlib
 .DELETE_ON_ERROR:

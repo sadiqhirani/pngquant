@@ -2,6 +2,12 @@
 
 CONFIG="config.mk"
 PREFIX="/usr/local"
+
+test -f lib/libimagequant.h || { git submodule init && git submodule update; } || {
+    echo "error: libimagequant not found in ./lib/"
+    echo "If you're using git, do clone with --recursive, or download from https://github.com/ImageOptim/libimagequant"
+    exit 1;
+}
 VERSION=$(grep LIQ_VERSION_STRING lib/libimagequant.h | grep -Eo "2\.[0-9.]+")
 
 DEBUG=
@@ -129,23 +135,23 @@ status() {
 # Append to CFLAGS if compiler supports flag, with optional prerequisite.
 # Fails on errors and warnings.
 conditional_cflags() {
-    if [ -z "echo | $("$CC" -xc -S -o /dev/null $2 $1 2>&1)" ]; then
+    if [ -z "$(echo | "$CC" -xc -S -o /dev/null $2 $1 - 2>&1)" ]; then
         cflags "$1"
     fi
 }
 
 # returns first matching file in directory
 find_f() {
-    echo $(find "$1" -not -type d -name "$2" -print -quit 2> /dev/null)
+    echo $(find "$1" -not -path '*/.git/*' -not -type d -name "$2" -print -quit 2> /dev/null)
 }
 
 # returns first matching file in directory (no symlinks)
 find_h() {
-    echo $(find "$1" -type f -name "$2" -print -quit 2> /dev/null)
+    echo $(find "$1" -not -path '*/.*/*' -type f -name "$2" -print -quit 2> /dev/null)
 }
 
 find_pkgconfig() {
-    LIBNAME=$1
+    local LIBNAME=$1
     if pkg-config --exists "$LIBNAME" &> /dev/null; then
         cflags "$(pkg-config --cflags "$LIBNAME")"
         lflags "$(pkg-config --libs "$LIBNAME")"
@@ -156,13 +162,13 @@ find_pkgconfig() {
 }
 
 find_static() {
-    LIBNAME=$1
-    HEADERPATTERN=$2
-    STATICPATTERN=$3
+    local LIBNAME=$1
+    local HEADERPATTERN=$2
+    local STATICPATTERN=$3
 
-    HPATH=$(find_h . "$HEADERPATTERN")
+    local HPATH=$(find_h . "$HEADERPATTERN")
     if [ -n "$HPATH" ]; then
-        APATH=$(find_f . "$STATICPATTERN")
+        local APATH=$(find_f . "$STATICPATTERN")
         if [ -n "$APATH" ]; then
             cflags "-I${HPATH%/*}"
             lflags "${APATH}"
@@ -173,12 +179,32 @@ find_static() {
     return 1
 }
 
+find_dynamic() {
+    local LIBNAME=$1
+    local HEADERPATTERN=$2
+    local DYNAMICPATTERN=$3
+    local HEADERDIR=$4
+    local LIBDIR=$5
+
+    local HPATH=$(find_h "$HEADERDIR" "$HEADERPATTERN")
+    if [ -n "$HPATH" ]; then
+        local SOPATH=$(find_f "$LIBDIR" "$DYNAMICPATTERN")
+        if [ -n "$SOPATH" ]; then
+            cflags "-I${HPATH%/*}"
+            lflags "-L${SOPATH%/*} -l$DYNAMICLIBNAME"
+            status "$LIBNAME" "shared ... $SOPATH"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 find_library() {
-    LIBNAME=$1
-    DYNAMICLIBNAME=$2
-    HEADERPATTERN=$3
-    STATICPATTERN=$4
-    DYNAMICPATTERN=$5
+    local LIBNAME=$1
+    local DYNAMICLIBNAME=$2
+    local HEADERPATTERN=$3
+    local STATICPATTERN=$4
+    local DYNAMICPATTERN=$5
 
     # try static in current directory first
     if find_static "$LIBNAME" "$HEADERPATTERN" "$STATICPATTERN"; then
@@ -192,15 +218,8 @@ find_library() {
 
     for i in "${DIRS[@]}"; do
         DIR=($i)
-        HPATH=$(find_h "${DIR[0]}" "$HEADERPATTERN")
-        if [ -n "$HPATH" ]; then
-            SOPATH=$(find_f "${DIR[1]}" "$DYNAMICPATTERN")
-            if [ -n "$SOPATH" ]; then
-                cflags "-I${HPATH%/*}"
-                lflags "-L${SOPATH%/*} -l$DYNAMICLIBNAME"
-                status "$LIBNAME" "shared ... $SOPATH"
-                return 0
-            fi
+        if find_dynamic "$LIBNAME" "$HEADERPATTERN" "$DYNAMICPATTERN" "${DIR[0]}" "${DIR[1]}"; then
+            return 0
         fi
     done
     return 1
@@ -227,31 +246,34 @@ error() {
 
 echo
 
-# basic check
-if ! echo "int main(){}" | "$CC" -xc -std=c99 -o /dev/null - > /dev/null; then
+# /tmp, because mingw has problems opening /dev/null and gives false negative
+if ! echo "int main(){}" | "$CC" -xc -std=c99 -o /tmp/gcccheck - > /dev/null; then
     error "Compiler" "$CC failed to compile anything (make sure it's installed and supports C99)"
 fi
 
 status "Compiler" "$CC"
 
 # init flags
-CFLAGS=${CFLAGS:--O3 -fno-math-errno -funroll-loops -fomit-frame-pointer -Wall}
+CFLAGS=${CFLAGS:--fno-math-errno -funroll-loops -fomit-frame-pointer -Wall}
 cflags "-std=c99 -I."
 
 # DEBUG
 if [ -z "$DEBUG" ]; then
-    cflags "-DNDEBUG"
+    cflags "-O3 -DNDEBUG"
     status "Debug" "no"
 else
-    cflags "-g"
+    cflags "-O1 -g"
     status "Debug" "yes"
 fi
 
 # SSE
 if [ "$SSE" = 'auto' ]; then
-    if [[ "$(uname -m)" =~ (amd|x86_)64 ||
-          "$(grep -E -m1 "^flags" /proc/cpuinfo)" =~ "sse" ]]; then
-        SSE=1
+    SSE=0
+    if type uname > /dev/null; then
+        if [[ "$(uname -m)" =~ "amd64" || "$(uname -m)" =~ "x86_64" ||
+              "$(grep -E -m1 "^flags" /proc/cpuinfo)" =~ "sse" ]]; then
+            SSE=1
+        fi
     fi
 fi
 
@@ -326,6 +348,8 @@ if [[ "$OSTYPE" =~ "darwin" ]]; then
     XCODE_PATH=$($XCODE_CMD -p)
     DIRS+=("$XCODE_PATH/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.10.sdk/usr/include $XCODE_PATH/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.10.sdk/usr/lib")
     DIRS+=("$XCODE_PATH/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.8.sdk/usr/include $XCODE_PATH/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.8.sdk/usr/lib")
+elif [[ "$OSTYPE" =~ "msys" ]]; then
+    SOLIBSUFFIX=dll
 else
     SOLIBSUFFIX=so
 fi
@@ -333,16 +357,16 @@ fi
 
 # libpng
 # try if given flags are enough
-SUCCESS=0
+HAS_LIBPNG=0
 if echo "#include \"png.h\"
     int main(){
     return !png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
 }" | "$CC" -xc -std=c99 -o /dev/null $CFLAGS $LDFLAGS - &> /dev/null; then
     status "libpng" "custom flags"
-    SUCCESS=1
+    HAS_LIBPNG=1
 fi
 
-if [ "$SUCCESS" -eq 0 ]; then
+if [ "$HAS_LIBPNG" -eq 0 ]; then
     # try static in the given directory
     PNGH=$(find_h "$LIBPNG_DIR" "png.h")
     if [ -n "$PNGH" ]; then
@@ -350,19 +374,22 @@ if [ "$SUCCESS" -eq 0 ]; then
         PNGH_MAJMIN=$(pngh_majmin "$PNGH")
         if [[ -n "$PNGH_STRING" && -n "$PNGH_MAJMIN" ]]; then
             LIBPNGA=$(find_f "$LIBPNG_DIR" "libpng${PNGH_MAJMIN}.a")
+            if [ -z "$LIBPNGA" ]; then
+                LIBPNGA=$(find_f "$LIBPNG_DIR" "libpng.a")
+            fi
             if [ -n "$LIBPNGA" ]; then
                 cflags "-I${PNGH%/*}"
                 lflags "${LIBPNGA}"
                 status "libpng" "static (${PNGH_STRING})"
-                SUCCESS=1
+                HAS_LIBPNG=1
             fi
         fi
     fi
 fi
 # try shared
-if [ "$SUCCESS" -eq 0 ]; then
+if [ "$HAS_LIBPNG" -eq 0 ]; then
     if find_pkgconfig libpng; then
-        SUCCESS=1
+        HAS_LIBPNG=1
     else
         for i in "${DIRS[@]}"; do
             DIR=($i)
@@ -376,7 +403,7 @@ if [ "$SUCCESS" -eq 0 ]; then
                         cflags "-I${PNGH%/*}"
                         lflags "-L${LIBPNGSO%/*} -lpng${PNGH_MAJMIN}"
                         status "libpng" "shared (${PNGH_STRING})"
-                        SUCCESS=1
+                        HAS_LIBPNG=1
                         break
                     fi
                 fi
@@ -384,11 +411,11 @@ if [ "$SUCCESS" -eq 0 ]; then
         done
     fi
 fi
-if [ "$SUCCESS" -eq 0 ]; then
+if [ "$HAS_LIBPNG" -eq 0 ]; then
     if [[ "$OSTYPE" =~ "darwin" ]]; then
         LIBPNG_CMD='`brew install libpng`'
     else
-        LIBPNG_CMD='`apt-get install libpng-dev` or `yum install libpng-devel`'
+        LIBPNG_CMD='`apt-get install libpng16-dev` or `apt-get install libpng-dev` or `yum install libpng-devel`'
     fi
     error "libpng" "not found (try: $LIBPNG_CMD)"
 fi
@@ -450,6 +477,7 @@ CC = $CC
 CFLAGS = $CFLAGS
 LDFLAGS = $LDFLAGS
 COCOA_READER = $COCOA_READER
+SOLIBSUFFIX = $SOLIBSUFFIX
 " > "$CONFIG"
 
 # Configure static library the same way
